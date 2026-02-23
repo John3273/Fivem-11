@@ -7,6 +7,7 @@ require_role('POLICE','LEADER');
 
 $db = db();
 $u  = current_user();
+$isLeader = in_array('LEADER', $u['roles'] ?? [], true);
 
 // Migrations
 $db->exec("CREATE TABLE IF NOT EXISTS cases (
@@ -39,13 +40,28 @@ $db->exec("CREATE TABLE IF NOT EXISTS case_visibility (
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
   UNIQUE(case_id, target_type, target_value)
 )");
-
 $db->exec("CREATE TABLE IF NOT EXISTS case_evidence (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   case_id INTEGER NOT NULL,
   title TEXT NOT NULL,
   file_path TEXT NOT NULL,
   original_name TEXT,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)");
+$db->exec("CREATE TABLE IF NOT EXISTS case_messages (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  case_id INTEGER NOT NULL,
+  sender_discord_id TEXT,
+  sender_name TEXT NOT NULL,
+  sender_label TEXT NOT NULL,
+  sender_type TEXT NOT NULL,
+  message TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+)");
+$db->exec("CREATE TABLE IF NOT EXISTS case_logs (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  case_id INTEGER NOT NULL,
+  log_text TEXT NOT NULL,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 )");
 
@@ -59,9 +75,30 @@ $ensureColumn = static function (PDO $db, string $table, string $column, string 
 $ensureColumn($db, 'cases', 'leader_notes', 'TEXT');
 $ensureColumn($db, 'cases', 'created_by_name', 'TEXT');
 $ensureColumn($db, 'cases', 'evidence_path', 'TEXT');
+$ensureColumn($db, 'cases', 'responsible_discord_id', 'TEXT');
+$ensureColumn($db, 'cases', 'responsible_name', 'TEXT');
+$ensureColumn($db, 'cases', 'responsible_badge', 'TEXT');
+$ensureColumn($db, 'cases', 'case_type_text', 'TEXT');
+$ensureColumn($db, 'cases', 'offense_code', 'TEXT');
+$ensureColumn($db, 'cases', 'journal_number', 'TEXT');
 $ensureColumn($db, 'users', 'police_display_name', 'TEXT');
 $ensureColumn($db, 'users', 'police_badge_number', 'TEXT');
 $ensureColumn($db, 'employees', 'secondary_department', 'TEXT');
+
+$typePath = __DIR__ . '/case_types.json';
+$caseTypes = [];
+if (is_file($typePath)) {
+  $decoded = json_decode((string)file_get_contents($typePath), true);
+  if (is_array($decoded)) {
+    foreach ($decoded as $entry) {
+      $txt = trim((string)($entry['GERNINGTXT'] ?? ''));
+      $code = trim((string)($entry['GERNINGSKODE'] ?? ''));
+      if ($txt !== '' && $code !== '') {
+        $caseTypes[] = ['GERNINGTXT' => $txt, 'GERNINGSKODE' => $code];
+      }
+    }
+  }
+}
 
 $employees = $db->query("SELECT id,discord_id,name,badge_number,department,secondary_department FROM employees ORDER BY name")->fetchAll();
 $departments = [];
@@ -76,12 +113,15 @@ if (!$departments) {
 
 $employeeById = [];
 $employeeNameByDiscord = [];
+$employeeBadgeByDiscord = [];
 foreach ($employees as $e) {
   $employeeById[(int)$e['id']] = $e;
   $did = trim((string)($e['discord_id'] ?? ''));
   if ($did !== '') {
     $name = trim((string)($e['name'] ?? ''));
+    $badge = trim((string)($e['badge_number'] ?? ''));
     $employeeNameByDiscord[$did] = ($name !== '' ? $name : $did);
+    $employeeBadgeByDiscord[$did] = $badge;
   }
 }
 
@@ -133,8 +173,29 @@ $redirectToCurrentView = static function (): void {
   redirect('sager.php?' . implode('&', $qs));
 };
 
-$canAccessCase = static function (array $case) use ($db, $myDiscordIds, $myDepartments, $myName, $myBadge, $u): bool {
+$formatDate = static function (string $dbDate): string {
+  $ts = strtotime($dbDate);
+  return $ts ? date('n/j/Y', $ts) : date('n/j/Y');
+};
+
+$appendCaseLog = static function (int $caseId, string $text) use ($db): void {
+  $stmt = $db->prepare("INSERT INTO case_logs(case_id, log_text) VALUES(?,?)");
+  $stmt->execute([$caseId, $text]);
+};
+
+$nextJournalNumber = static function (string $offenseCode) use ($db): string {
+  $stmt = $db->prepare("SELECT COUNT(*) FROM cases WHERE offense_code=?");
+  $stmt->execute([$offenseCode]);
+  $sequence = ((int)$stmt->fetchColumn()) + 1;
+  return '1000-' . $offenseCode . '-' . str_pad((string)$sequence, 5, '0', STR_PAD_LEFT) . '-' . date('y');
+};
+
+$canAccessCase = static function (array $case) use ($db, $myDiscordIds, $myDepartments, $myName, $myBadge, $u, $isLeader): bool {
+  if ($isLeader) return true;
   if ((string)($case['created_by_discord_id'] ?? '') === (string)($u['discord_id'] ?? '')) return true;
+
+  $responsibleDiscord = (string)($case['responsible_discord_id'] ?? $case['assigned_discord_id'] ?? '');
+  if ($responsibleDiscord !== '' && in_array($responsibleDiscord, array_map('strval', $myDiscordIds), true)) return true;
 
   if (($case['assigned_type'] ?? '') === 'person') {
     $assignedDiscord = (string)($case['assigned_discord_id'] ?? '');
@@ -191,15 +252,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   $action = $_POST['action'] ?? '';
 
   if ($action === 'create_case') {
-    $title = trim($_POST['title'] ?? '');
-    $description = trim($_POST['description'] ?? '');
+    $title = trim((string)($_POST['title'] ?? ''));
+    $description = trim((string)($_POST['description'] ?? ''));
+    $selectedType = trim((string)($_POST['case_type_text'] ?? ''));
     $employeeIds = array_values(array_filter(array_map('intval', (array)($_POST['employee_ids'] ?? []))));
     $departmentNames = array_values(array_filter(array_map('trim', (array)($_POST['assigned_departments'] ?? []))));
 
-    if ($title !== '' && $description !== '') {
+    $offenseCode = '';
+    foreach ($caseTypes as $t) {
+      if ($t['GERNINGTXT'] === $selectedType) {
+        $offenseCode = $t['GERNINGSKODE'];
+        break;
+      }
+    }
+
+    if ($title !== '' && $description !== '' && $selectedType !== '' && $offenseCode !== '') {
+      $journal = $nextJournalNumber($offenseCode);
       $uid = 'S-' . date('ymd') . '-' . substr(str_shuffle('ABCDEFGHJKLMNPQRSTUVWXYZ0123456789'), 0, 4);
-      $stmt = $db->prepare("INSERT INTO cases(case_uid,title,description,created_by_discord_id,created_by_name,assigned_type,assigned_discord_id,assigned_name,assigned_badge,evidence_path)
-                            VALUES(?,?,?,?,?,?,?,?,?,?)");
+      $stmt = $db->prepare("INSERT INTO cases(case_uid,title,description,created_by_discord_id,created_by_name,assigned_type,assigned_discord_id,assigned_name,assigned_badge,responsible_discord_id,responsible_name,responsible_badge,case_type_text,offense_code,journal_number,evidence_path)
+                            VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)");
       $stmt->execute([
         $uid,
         $title,
@@ -210,10 +281,17 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $u['discord_id'],
         $myDisplayName,
         $myBadge,
+        $u['discord_id'],
+        $myDisplayName,
+        $myBadge,
+        $selectedType,
+        $offenseCode,
+        $journal,
         null
       ]);
       $newCaseId = (int)$db->lastInsertId();
       $saveVisibility($newCaseId, $employeeIds, $departmentNames);
+      $appendCaseLog($newCaseId, 'Sagen blev oprettet af "' . $myDisplayName . '" - ' . $formatDate(date('Y-m-d H:i:s')));
 
       $evidenceTitle = trim((string)($_POST['evidence_title'] ?? ''));
       try {
@@ -225,7 +303,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $stmt->execute([$newCaseId, ($evidenceTitle !== '' ? $evidenceTitle : 'Bevismateriale'), $safePath, basename((string)($_FILES['evidence']['name'] ?? $safePath))]);
           }
         }
-      } catch (Throwable $e) { die("Upload fejl: " . h($e->getMessage())); }
+      } catch (Throwable $e) {
+        die('Upload fejl: ' . h($e->getMessage()));
+      }
     }
     redirect('sager.php');
   }
@@ -234,11 +314,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $caseId = (int)($_POST['case_id'] ?? 0);
     $employeeIds = array_values(array_filter(array_map('intval', (array)($_POST['employee_ids'] ?? []))));
     $departmentNames = array_values(array_filter(array_map('trim', (array)($_POST['assigned_departments'] ?? []))));
-    $note = trim((string)($_POST['leader_notes'] ?? ''));
     $newEvidenceTitle = trim((string)($_POST['new_evidence_title'] ?? ''));
 
     if ($caseId > 0) {
-      $stmt = $db->prepare("SELECT * FROM cases WHERE id=?");
+      $stmt = $db->prepare('SELECT * FROM cases WHERE id=?');
       $stmt->execute([$caseId]);
       $case = $stmt->fetch();
       if ($case && $canAccessCase($case) && (int)($case['archived'] ?? 0) === 0) {
@@ -247,38 +326,112 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           if ($up) {
             $safePath = $normalizeUploadPath($up);
             if ($safePath !== '') {
-              $stmt = $db->prepare("INSERT INTO case_evidence(case_id, title, file_path, original_name) VALUES(?,?,?,?)");
+              $stmt = $db->prepare('INSERT INTO case_evidence(case_id, title, file_path, original_name) VALUES(?,?,?,?)');
               $stmt->execute([$caseId, ($newEvidenceTitle !== '' ? $newEvidenceTitle : 'Bevismateriale'), $safePath, basename((string)($_FILES['evidence']['name'] ?? $safePath))]);
             }
           }
         } catch (Throwable $e) {
-          die("Upload fejl: " . h($e->getMessage()));
+          die('Upload fejl: ' . h($e->getMessage()));
         }
         $saveVisibility($caseId, $employeeIds, $departmentNames);
-        $stmt = $db->prepare("UPDATE cases SET leader_notes=?, status='Påbegyndt' WHERE id=?");
-        $stmt->execute([$note, $caseId]);
+        $db->prepare("UPDATE cases SET status='Påbegyndt' WHERE id=?")->execute([$caseId]);
       }
     }
     $redirectToCurrentView();
   }
 
+  if ($action === 'transfer_responsible' && $isLeader) {
+    $caseId = (int)($_POST['case_id'] ?? 0);
+    $newResponsible = (int)($_POST['responsible_employee_id'] ?? 0);
+    if ($caseId > 0 && $newResponsible > 0 && isset($employeeById[$newResponsible])) {
+      $stmt = $db->prepare('SELECT * FROM cases WHERE id=?');
+      $stmt->execute([$caseId]);
+      $case = $stmt->fetch();
+      if ($case && $canAccessCase($case) && (int)($case['archived'] ?? 0) === 0) {
+        $emp = $employeeById[$newResponsible];
+        $newDid = trim((string)($emp['discord_id'] ?? ''));
+        $newName = trim((string)($emp['name'] ?? ''));
+        $newBadge = trim((string)($emp['badge_number'] ?? ''));
+        $oldName = trim((string)($case['responsible_name'] ?? $case['assigned_name'] ?? 'Ukendt'));
+
+        $db->prepare("UPDATE cases SET responsible_discord_id=?, responsible_name=?, responsible_badge=?, assigned_discord_id=?, assigned_name=?, assigned_badge=?, status='Påbegyndt' WHERE id=?")
+          ->execute([$newDid, $newName, $newBadge, $newDid, $newName, $newBadge, $caseId]);
+
+        $dateText = $formatDate(date('Y-m-d H:i:s'));
+        $appendCaseLog($caseId, '"' . $oldName . '" fik fradelt Sagsansvarlighed "' . $newName . '" fik tildelt Sagsansvarlighed - ' . $dateText);
+      }
+    }
+    $redirectToCurrentView();
+  }
+
+  if ($action === 'assign_department' && $isLeader) {
+    $caseId = (int)($_POST['case_id'] ?? 0);
+    $dep = trim((string)($_POST['department'] ?? ''));
+    if ($caseId > 0 && $dep !== '') {
+      $stmt = $db->prepare('SELECT * FROM cases WHERE id=?');
+      $stmt->execute([$caseId]);
+      $case = $stmt->fetch();
+      if ($case && $canAccessCase($case)) {
+        $db->prepare("UPDATE cases SET assigned_type='department', assigned_department=?, status='Påbegyndt' WHERE id=?")->execute([$dep, $caseId]);
+        $person = trim((string)($case['responsible_name'] ?? $case['assigned_name'] ?? 'Ukendt'));
+        $appendCaseLog($caseId, 'Sagen blev tildelt "' . $person . '","' . $dep . '" - ' . $formatDate(date('Y-m-d H:i:s')));
+      }
+    }
+    $redirectToCurrentView();
+  }
+
+  if ($action === 'unassign_case' && $isLeader) {
+    $caseId = (int)($_POST['case_id'] ?? 0);
+    if ($caseId > 0) {
+      $stmt = $db->prepare('SELECT * FROM cases WHERE id=?');
+      $stmt->execute([$caseId]);
+      $case = $stmt->fetch();
+      if ($case && $canAccessCase($case)) {
+        $person = trim((string)($case['responsible_name'] ?? $case['assigned_name'] ?? 'Ukendt'));
+        $db->prepare("UPDATE cases SET assigned_type='person', assigned_department=NULL, status='Påbegyndt' WHERE id=?")->execute([$caseId]);
+        $appendCaseLog($caseId, 'Sagen blev fradelt "' . $person . '" - ' . $formatDate(date('Y-m-d H:i:s')));
+      }
+    }
+    $redirectToCurrentView();
+  }
+
+  if ($action === 'send_message') {
+    $caseId = (int)($_POST['case_id'] ?? 0);
+    $message = trim((string)($_POST['message'] ?? ''));
+    if ($caseId > 0 && $message !== '') {
+      $stmt = $db->prepare('SELECT * FROM cases WHERE id=?');
+      $stmt->execute([$caseId]);
+      $case = $stmt->fetch();
+      if ($case && $canAccessCase($case)) {
+        $isPoliceSender = in_array('POLICE', $u['roles'] ?? [], true) || in_array('LEADER', $u['roles'] ?? [], true);
+        $senderType = $isPoliceSender ? 'police' : 'citizen';
+        $senderLabel = $isPoliceSender
+          ? $myDisplayName . ' (betjent)' . ($myBadge !== '' ? ' - ' . $myBadge : '')
+          : $myDisplayName . ' (borger)';
+
+        $stmt = $db->prepare('INSERT INTO case_messages(case_id,sender_discord_id,sender_name,sender_label,sender_type,message) VALUES(?,?,?,?,?,?)');
+        $stmt->execute([$caseId, (string)($u['discord_id'] ?? ''), $myDisplayName, $senderLabel, $senderType, $message]);
+      }
+    }
+    $redirectToCurrentView();
+  }
 
   if ($action === 'delete_evidence') {
     $caseId = (int)($_POST['case_id'] ?? 0);
     $evidenceId = (int)($_POST['evidence_id'] ?? 0);
     if ($caseId > 0 && $evidenceId > 0) {
-      $stmt = $db->prepare("SELECT * FROM cases WHERE id=?");
+      $stmt = $db->prepare('SELECT * FROM cases WHERE id=?');
       $stmt->execute([$caseId]);
       $case = $stmt->fetch();
       if ($case && $canAccessCase($case)) {
-        $stmt = $db->prepare("SELECT file_path FROM case_evidence WHERE id=? AND case_id=?");
+        $stmt = $db->prepare('SELECT file_path FROM case_evidence WHERE id=? AND case_id=?');
         $stmt->execute([$evidenceId, $caseId]);
         $path = (string)$stmt->fetchColumn();
         if ($path !== '') {
           $abs = __DIR__ . '/' . ltrim($path, '/');
           if (is_file($abs)) { try { unlink($abs); } catch (Throwable $_) {} }
         }
-        $db->prepare("DELETE FROM case_evidence WHERE id=? AND case_id=?")->execute([$evidenceId, $caseId]);
+        $db->prepare('DELETE FROM case_evidence WHERE id=? AND case_id=?')->execute([$evidenceId, $caseId]);
       }
     }
     $redirectToCurrentView();
@@ -287,15 +440,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   if ($action === 'archive_case') {
     $caseId = (int)($_POST['case_id'] ?? 0);
     if ($caseId > 0) {
-      $stmt = $db->prepare("SELECT file_path FROM case_evidence WHERE case_id=?");
+      $stmt = $db->prepare('SELECT file_path FROM case_evidence WHERE case_id=?');
       $stmt->execute([$caseId]);
       foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $ev) {
         $abs = __DIR__ . '/' . ltrim((string)$ev, '/');
         if (is_file($abs)) { try { unlink($abs); } catch (Throwable $_) {} }
       }
-      $db->prepare("DELETE FROM case_evidence WHERE case_id=?")->execute([$caseId]);
-      $stmt = $db->prepare("UPDATE cases SET archived=1, status='Lukket', evidence_path=NULL WHERE id=?");
-      $stmt->execute([$caseId]);
+      $db->prepare('DELETE FROM case_evidence WHERE case_id=?')->execute([$caseId]);
+      $db->prepare("UPDATE cases SET archived=1, status='Lukket', evidence_path=NULL WHERE id=?")->execute([$caseId]);
     }
     redirect('sager.php');
   }
@@ -303,19 +455,21 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   if ($action === 'delete_case') {
     $caseId = (int)($_POST['case_id'] ?? 0);
     if ($caseId > 0) {
-      $stmt = $db->prepare("SELECT * FROM cases WHERE id=?");
+      $stmt = $db->prepare('SELECT * FROM cases WHERE id=?');
       $stmt->execute([$caseId]);
       $case = $stmt->fetch();
       if ($case && $canAccessCase($case) && (int)($case['archived'] ?? 0) === 1) {
-        $stmt = $db->prepare("SELECT file_path FROM case_evidence WHERE case_id=?");
+        $stmt = $db->prepare('SELECT file_path FROM case_evidence WHERE case_id=?');
         $stmt->execute([$caseId]);
         foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $ev) {
           $abs = __DIR__ . '/' . ltrim((string)$ev, '/');
           if (is_file($abs)) { try { unlink($abs); } catch (Throwable $_) {} }
         }
-        $db->prepare("DELETE FROM case_evidence WHERE case_id=?")->execute([$caseId]);
-        $db->prepare("DELETE FROM case_visibility WHERE case_id=?")->execute([$caseId]);
-        $db->prepare("DELETE FROM cases WHERE id=?")->execute([$caseId]);
+        $db->prepare('DELETE FROM case_evidence WHERE case_id=?')->execute([$caseId]);
+        $db->prepare('DELETE FROM case_visibility WHERE case_id=?')->execute([$caseId]);
+        $db->prepare('DELETE FROM case_messages WHERE case_id=?')->execute([$caseId]);
+        $db->prepare('DELETE FROM case_logs WHERE case_id=?')->execute([$caseId]);
+        $db->prepare('DELETE FROM cases WHERE id=?')->execute([$caseId]);
       }
     }
     $redirectToCurrentView();
@@ -324,7 +478,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 $viewRaw = (string)($_GET['view'] ?? 'mine');
 $view = in_array($viewRaw, ['mine','all','archive','global_archive'], true) ? $viewRaw : 'mine';
-$search = trim($_GET['q'] ?? '');
+$search = trim((string)($_GET['q'] ?? ''));
 $isGlobalArchiveView = $view === 'global_archive';
 $isPersonalArchiveView = $view === 'archive';
 $isArchivedView = $isGlobalArchiveView || $isPersonalArchiveView;
@@ -343,16 +497,17 @@ if ($myDepartments) {
   $visParams = array_merge($visParams, $myDepartments);
 }
 if ($visParts) {
-  $stmt = $db->prepare("SELECT DISTINCT case_id FROM case_visibility WHERE " . implode(' OR ', $visParts));
+  $stmt = $db->prepare('SELECT DISTINCT case_id FROM case_visibility WHERE ' . implode(' OR ', $visParts));
   $stmt->execute($visParams);
   $visibleCaseIds = array_map(static fn($r) => (int)$r['case_id'], $stmt->fetchAll());
 }
 
-$where = ["archived=" . ($isArchivedView ? '1' : '0')];
+$where = ['archived=' . ($isArchivedView ? '1' : '0')];
 $params = [];
 
-if ($view === 'mine' || $view === 'archive') {
-  $accessParts = ["created_by_discord_id=?", "(assigned_type='person' AND assigned_discord_id=?)"];
+if (($view === 'mine' || $view === 'archive') && !$isLeader) {
+  $accessParts = ['created_by_discord_id=?', "(assigned_type='person' AND assigned_discord_id=?)", 'responsible_discord_id=?'];
+  $params[] = (string)$u['discord_id'];
   $params[] = (string)$u['discord_id'];
   $params[] = (string)$u['discord_id'];
 
@@ -370,19 +525,24 @@ if ($view === 'mine' || $view === 'archive') {
 }
 
 if ($search !== '') {
-  $where[] = "(case_uid LIKE ? OR title LIKE ? OR description LIKE ? OR COALESCE(created_by_name,'') LIKE ? OR COALESCE(created_by_discord_id,'') LIKE ?)";
+  $where[] = "(journal_number LIKE ? OR case_uid LIKE ? OR title LIKE ? OR description LIKE ? OR COALESCE(created_by_name,'') LIKE ? OR COALESCE(created_by_discord_id,'') LIKE ?)";
   $like = '%' . $search . '%';
-  array_push($params, $like, $like, $like, $like, $like);
+  array_push($params, $like, $like, $like, $like, $like, $like);
 }
 
-$stmt = $db->prepare("SELECT * FROM cases WHERE " . implode(' AND ', $where) . " ORDER BY id DESC");
+$stmt = $db->prepare('SELECT * FROM cases WHERE ' . implode(' AND ', $where) . ' ORDER BY id DESC');
 $stmt->execute($params);
 $visibleCases = $stmt->fetchAll();
 
 $caseVisibility = [];
+$caseEvidence = [];
+$caseMessages = [];
+$caseLogs = [];
+
 if ($visibleCases) {
   $ids = array_map(static fn($c) => (int)$c['id'], $visibleCases);
   $ph = implode(',', array_fill(0, count($ids), '?'));
+
   $stmt = $db->prepare("SELECT case_id,target_type,target_value FROM case_visibility WHERE case_id IN ($ph) ORDER BY id ASC");
   $stmt->execute($ids);
   foreach ($stmt->fetchAll() as $row) {
@@ -391,59 +551,73 @@ if ($visibleCases) {
     if ($row['target_type'] === 'employee') $caseVisibility[$cid]['employees'][] = (string)$row['target_value'];
     if ($row['target_type'] === 'department') $caseVisibility[$cid]['departments'][] = (string)$row['target_value'];
   }
-}
 
-$caseEvidence = [];
-if ($visibleCases) {
-  $ids = array_map(static fn($c) => (int)$c['id'], $visibleCases);
-  $ph = implode(',', array_fill(0, count($ids), '?'));
   $stmt = $db->prepare("SELECT id, case_id, title, file_path, original_name, created_at FROM case_evidence WHERE case_id IN ($ph) ORDER BY created_at DESC, id DESC");
   $stmt->execute($ids);
   foreach ($stmt->fetchAll() as $ev) {
     $caseEvidence[(int)$ev['case_id']][] = $ev;
   }
+
+  $stmt = $db->prepare("SELECT id,case_id,sender_label,message,created_at FROM case_messages WHERE case_id IN ($ph) ORDER BY created_at ASC, id ASC");
+  $stmt->execute($ids);
+  foreach ($stmt->fetchAll() as $msg) {
+    $caseMessages[(int)$msg['case_id']][] = $msg;
+  }
+
+  $stmt = $db->prepare("SELECT id,case_id,log_text,created_at FROM case_logs WHERE case_id IN ($ph) ORDER BY created_at DESC, id DESC");
+  $stmt->execute($ids);
+  foreach ($stmt->fetchAll() as $log) {
+    $caseLogs[(int)$log['case_id']][] = $log;
+  }
 }
 
 include __DIR__ . '/_layout.php';
 ?>
-<div class="container">
+<div class="container cases-page">
   <div class="card">
     <h2>Opret sag</h2>
-    <details style="margin-top:12px">
+    <details class="modern-details" style="margin-top:12px">
       <summary class="btn btn-solid">+ Opret sag</summary>
-    <form method="post" enctype="multipart/form-data" style="margin-top:12px">
-      <input type="hidden" name="action" value="create_case"/>
-      <label>Titel</label>
-      <input name="title" required>
-      <label>Beskrivelse</label>
-      <textarea name="description" rows="4" required></textarea>
-      <label>Bevis titel (valgfri)</label>
-      <input name="evidence_title" placeholder="Fx. Bodycam klip fra 12/04">
-      <label>Bevismateriale (valgfri)</label>
-      <input type="file" name="evidence" accept="image/*,.pdf,.txt,.zip,.rar,.7z,.doc,.docx">
+      <form method="post" enctype="multipart/form-data" style="margin-top:12px">
+        <input type="hidden" name="action" value="create_case"/>
+        <label>Titel</label>
+        <input name="title" required>
+        <label>Type</label>
+        <select name="case_type_text" required>
+          <option value="">Vælg type...</option>
+          <?php foreach ($caseTypes as $t): ?>
+            <option value="<?= h($t['GERNINGTXT']) ?>"><?= h($t['GERNINGTXT']) ?> (<?= h($t['GERNINGSKODE']) ?>)</option>
+          <?php endforeach; ?>
+        </select>
+        <label>Beskrivelse</label>
+        <textarea name="description" rows="4" required></textarea>
+        <label>Bevis titel (valgfri)</label>
+        <input name="evidence_title" placeholder="Fx. Bodycam klip fra 12/04">
+        <label>Bevismateriale (valgfri)</label>
+        <input type="file" name="evidence" accept="image/*,.pdf,.txt,.zip,.rar,.7z,.doc,.docx">
 
-      <label>Synlig for afdelinger</label>
-      <input type="text" class="assign-filter" placeholder="Søg afdeling...">
-      <div data-filter-list style="border:1px solid var(--border);border-radius:6px;max-height:170px;overflow:auto;padding:6px;">
-        <table class="table"><tbody>
-        <?php foreach ($departments as $d): ?>
-          <tr class="assign-row"><td style="width:36px;"><input style="width:auto;" type="checkbox" name="assigned_departments[]" value="<?= h($d['department']) ?>"></td><td><?= h($d['department']) ?></td></tr>
-        <?php endforeach; ?>
-        </tbody></table>
-      </div>
+        <label>Synlig for afdelinger</label>
+        <input type="text" class="assign-filter" placeholder="Søg afdeling...">
+        <div data-filter-list class="picker-list">
+          <table class="table"><tbody>
+          <?php foreach ($departments as $d): ?>
+            <tr class="assign-row"><td style="width:36px;"><input style="width:auto;" type="checkbox" name="assigned_departments[]" value="<?= h($d['department']) ?>"></td><td><?= h($d['department']) ?></td></tr>
+          <?php endforeach; ?>
+          </tbody></table>
+        </div>
 
-      <label>Synlig for medarbejdere</label>
-      <input type="text" class="assign-filter" placeholder="Søg medarbejder...">
-      <div data-filter-list style="border:1px solid var(--border);border-radius:6px;max-height:220px;overflow:auto;padding:6px;">
-        <table class="table"><tbody>
-        <?php foreach ($employees as $e): ?>
-          <tr class="assign-row"><td style="width:36px;"><input style="width:auto;" type="checkbox" name="employee_ids[]" value="<?= (int)$e['id'] ?>"></td><td><?= h($e['name']) ?> (<?= h($e['badge_number']) ?>)</td></tr>
-        <?php endforeach; ?>
-        </tbody></table>
-      </div>
+        <label>Synlig for medarbejdere</label>
+        <input type="text" class="assign-filter" placeholder="Søg medarbejder...">
+        <div data-filter-list class="picker-list">
+          <table class="table"><tbody>
+          <?php foreach ($employees as $e): ?>
+            <tr class="assign-row"><td style="width:36px;"><input style="width:auto;" type="checkbox" name="employee_ids[]" value="<?= (int)$e['id'] ?>"></td><td><?= h($e['name']) ?> (<?= h($e['badge_number']) ?>)</td></tr>
+          <?php endforeach; ?>
+          </tbody></table>
+        </div>
 
-      <div style="margin-top:12px;"><button type="submit">Opret sag</button></div>
-    </form>
+        <div style="margin-top:12px;"><button type="submit">Opret sag</button></div>
+      </form>
     </details>
   </div>
 
@@ -459,7 +633,7 @@ include __DIR__ . '/_layout.php';
         <input type="hidden" name="view" value="<?= h($view) ?>"/>
         <div>
           <label style="margin:0 0 4px 0;">Søg sager</label>
-          <input name="q" value="<?= h($search) ?>" placeholder="Søg på ID, titel, tekst..."/>
+          <input name="q" value="<?= h($search) ?>" placeholder="Søg på journal nr, titel, tekst..."/>
         </div>
         <button type="submit">Søg</button>
       </form>
@@ -470,39 +644,35 @@ include __DIR__ . '/_layout.php';
     <h2>
       <?php if ($view==='all'): ?>Alle Sager<?php elseif ($view==='global_archive'): ?>Globalt arkiv<?php elseif ($view==='archive'): ?>Mit arkiv<?php else: ?>Mine Sager<?php endif; ?>
     </h2>
-    <table class="table"><thead><tr><th>ID</th><th>Titel</th><th>Lavet af</th><th>Tildelt</th><th>Status</th><th>Handling</th></tr></thead><tbody>
+    <table class="table">
+      <thead><tr><th>Journal Nr.</th><th>Titel</th><th>Sagsansvarlig</th><th>Type / Gerningskode</th><th>Status</th><th>Handling</th></tr></thead>
+      <tbody>
       <?php foreach ($visibleCases as $c): ?>
+        <?php
+          $responsible = trim((string)($c['responsible_name'] ?? $c['assigned_name'] ?? ''));
+          if ($responsible === '') $responsible = trim((string)($c['created_by_name'] ?? 'Ukendt'));
+        ?>
         <tr>
-          <?php
-            $cv = $caseVisibility[(int)$c['id']] ?? ['employees' => [], 'departments' => []];
-            $empNames = [];
-            foreach (($cv['employees'] ?? []) as $did) $empNames[] = $employeeNameByDiscord[$did] ?? $did;
-            $depNames = $cv['departments'] ?? [];
-            $assignedParts = [];
-            if ($depNames) $assignedParts[] = 'Afdelinger: ' . implode(', ', $depNames);
-            if ($empNames) $assignedParts[] = 'Medarbejdere: ' . implode(', ', $empNames);
-            $createdByLabel = trim((string)($c['created_by_name'] ?? ''));
-            if ($createdByLabel === '') $createdByLabel = (string)($c['created_by_discord_id'] ?? 'Ukendt');
-          ?>
-          <td><?= h($c['case_uid']) ?></td>
+          <td><?= h((string)($c['journal_number'] ?? $c['case_uid'])) ?></td>
           <td><?= h($c['title']) ?></td>
-          <td><?= h($createdByLabel) ?></td>
-          <td><?= $assignedParts ? h(implode(' | ', $assignedParts)) : '<span class="muted">Ingen</span>' ?></td>
+          <td><?= h($responsible) ?></td>
+          <td><?= h((string)($c['case_type_text'] ?? 'Ukendt')) ?> / <?= h((string)($c['offense_code'] ?? '-')) ?></td>
           <td><?= h($c['status']) ?></td>
           <td>
             <button class="btn" type="button" onclick="openCaseModal(<?= (int)$c['id'] ?>)">Åbn</button>
             <?php if (!$isArchivedView): ?>
-              <form method="post" style="display:inline-block;">
-                <input type="hidden" name="action" value="archive_case"/>
-                <input type="hidden" name="case_id" value="<?= (int)$c['id'] ?>"/>
-                <button type="submit">Arkivér</button>
-              </form>
+            <form method="post" style="display:inline-block;">
+              <input type="hidden" name="action" value="archive_case"/>
+              <input type="hidden" name="case_id" value="<?= (int)$c['id'] ?>"/>
+              <button type="submit">Arkivér</button>
+            </form>
             <?php endif; ?>
           </td>
         </tr>
       <?php endforeach; ?>
       <?php if (!$visibleCases): ?><tr><td colspan="6">Ingen sager.</td></tr><?php endif; ?>
-    </tbody></table>
+      </tbody>
+    </table>
   </div>
 
   <?php foreach ($visibleCases as $c): ?>
@@ -510,18 +680,48 @@ include __DIR__ . '/_layout.php';
       <?php
         $cvm = $caseVisibility[(int)$c['id']] ?? ['employees' => [], 'departments' => []];
         $empNamesM = [];
-        foreach (($cvm['employees'] ?? []) as $did) $empNamesM[] = $employeeNameByDiscord[$did] ?? $did;
+        foreach (($cvm['employees'] ?? []) as $did) {
+          $name = $employeeNameByDiscord[$did] ?? $did;
+          $badge = trim((string)($employeeBadgeByDiscord[$did] ?? ''));
+          $empNamesM[] = $badge !== '' ? $name . ' - ' . $badge : $name;
+        }
         $assignedLabel = implode(', ', array_filter(array_merge(($cvm['departments'] ?? []), $empNamesM)));
         $createdByModal = trim((string)($c['created_by_name'] ?? ''));
         if ($createdByModal === '') $createdByModal = (string)($c['created_by_discord_id'] ?? 'Ukendt');
+        $responsibleModal = trim((string)($c['responsible_name'] ?? $c['assigned_name'] ?? $createdByModal));
       ?>
       <h3 style="margin-top:0;"><?= h($c['title']) ?></h3>
-      <p><b>Rapport ID:</b> <?= h($c['case_uid']) ?></p>
-      <p><b>Lavet af:</b> <?= h($createdByModal) ?></p>
+      <p><b>Journal Nr.:</b> <?= h((string)($c['journal_number'] ?? $c['case_uid'])) ?></p>
+      <p><b>Sagsansvarlig:</b> <?= h($responsibleModal) ?></p>
+      <p><b>Type:</b> <?= h((string)($c['case_type_text'] ?? 'Ukendt')) ?> &nbsp;|&nbsp; <b>Gerningskode:</b> <?= h((string)($c['offense_code'] ?? '-')) ?></p>
       <p><b>Beskrivelse:</b><br><?= nl2br(h($c['description'])) ?></p>
+
+      <h4 style="margin:14px 0 8px 0;">Kommentarer</h4>
+      <div class="chat-box">
+        <?php foreach (($caseMessages[(int)$c['id']] ?? []) as $msg): ?>
+          <div class="chat-msg">
+            <div><b><?= h($msg['sender_label']) ?></b> · <span class="muted"><?= h($msg['created_at']) ?></span></div>
+            <div><?= nl2br(h($msg['message'])) ?></div>
+          </div>
+        <?php endforeach; ?>
+        <?php if (empty($caseMessages[(int)$c['id']] ?? [])): ?>
+          <div class="muted">Ingen kommentarer endnu.</div>
+        <?php endif; ?>
+      </div>
+      <?php if (!$isArchivedView): ?>
+      <form method="post" style="margin-top:8px;display:flex;gap:8px;">
+        <input type="hidden" name="action" value="send_message"/>
+        <input type="hidden" name="case_id" value="<?= (int)$c['id'] ?>"/>
+        <input type="hidden" name="view" value="<?= h($view) ?>"/>
+        <input type="hidden" name="q" value="<?= h($search) ?>"/>
+        <input type="text" name="message" placeholder="Skriv kommentar..." required>
+        <button type="submit" class="btn btn-solid">Send</button>
+      </form>
+      <?php endif; ?>
+
       <h4 style="margin:12px 0 8px 0;">Bevismateriale</h4>
       <?php if (!$isArchivedView): ?>
-      <form method="post" enctype="multipart/form-data" style="margin:0 0 10px 0;padding:10px;border:1px solid rgba(255,255,255,.08);border-radius:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+      <form method="post" enctype="multipart/form-data" style="margin:0 0 10px 0;padding:10px;border:1px solid var(--border);border-radius:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
         <input type="hidden" name="action" value="save_case_changes"/>
         <input type="hidden" name="case_id" value="<?= (int)$c['id'] ?>"/>
         <input type="hidden" name="view" value="<?= h($view) ?>"/>
@@ -535,13 +735,13 @@ include __DIR__ . '/_layout.php';
         <thead><tr><th>Bevis titel</th><th>Tilføjet dato</th><th>Fil</th><?php if (!$isArchivedView): ?><th>Handling</th><?php endif; ?></tr></thead>
         <tbody>
         <?php foreach (($caseEvidence[(int)$c['id']] ?? []) as $ev): ?>
+          <?php
+            $normalizedPath = $normalizeUploadPath((string)($ev['file_path'] ?? ''));
+            $downloadName = (string)($ev['original_name'] ?: basename($normalizedPath));
+          ?>
           <tr>
             <td><?= h($ev['title']) ?></td>
             <td><?= h($ev['created_at']) ?></td>
-                        <?php
-              $normalizedPath = $normalizeUploadPath((string)($ev['file_path'] ?? ''));
-              $downloadName = (string)($ev['original_name'] ?: basename($normalizedPath));
-            ?>
             <td><a href="download_file.php?path=<?= urlencode($normalizedPath) ?>&filename=<?= urlencode($downloadName) ?>" download><?= h($downloadName) ?></a></td>
             <?php if (!$isArchivedView): ?>
             <td>
@@ -562,46 +762,67 @@ include __DIR__ . '/_layout.php';
         <?php endif; ?>
         </tbody>
       </table>
+
       <p><b>Tildelt til:</b> <?= $assignedLabel !== '' ? h($assignedLabel) : '<span class="muted">Ingen</span>' ?></p>
 
-      <?php if (!$isArchivedView): ?>
-      <?php $currentVisibility = $caseVisibility[(int)$c['id']] ?? ['employees' => [], 'departments' => []]; ?>
-      <form method="post" enctype="multipart/form-data" style="margin-top:12px;">
-        <input type="hidden" name="action" value="save_case_changes"/>
+      <?php if ($isLeader && !$isArchivedView): ?>
+      <h4 style="margin:12px 0 8px 0;">Sagsansvarlig (leader)</h4>
+      <form method="post" style="display:flex;gap:8px;align-items:end;flex-wrap:wrap;">
+        <input type="hidden" name="action" value="transfer_responsible"/>
         <input type="hidden" name="case_id" value="<?= (int)$c['id'] ?>"/>
         <input type="hidden" name="view" value="<?= h($view) ?>"/>
         <input type="hidden" name="q" value="<?= h($search) ?>"/>
-
-        <label>Synlig for afdelinger</label>
-        <input type="text" class="assign-filter" placeholder="Søg afdeling...">
-        <div data-filter-list style="border:1px solid var(--border);border-radius:6px;max-height:170px;overflow:auto;padding:6px;">
-          <table class="table"><tbody>
-          <?php foreach ($departments as $d): ?>
-            <tr class="assign-row"><td style="width:36px;"><input style="width:auto;" type="checkbox" name="assigned_departments[]" value="<?= h($d['department']) ?>" <?= in_array((string)$d['department'], $currentVisibility['departments'], true) ? 'checked' : '' ?>></td><td><?= h($d['department']) ?></td></tr>
-          <?php endforeach; ?>
-          </tbody></table>
+        <div style="min-width:260px;flex:1;">
+          <label>Vælg ny sagsansvarlig</label>
+          <select name="responsible_employee_id" required>
+            <option value="">Vælg medarbejder</option>
+            <?php foreach ($employees as $e): ?>
+              <option value="<?= (int)$e['id'] ?>"><?= h($e['name']) ?> (<?= h($e['badge_number']) ?>)</option>
+            <?php endforeach; ?>
+          </select>
         </div>
-
-        <label>Synlig for medarbejdere</label>
-        <input type="text" class="assign-filter" placeholder="Søg medarbejder...">
-        <div data-filter-list style="border:1px solid var(--border);border-radius:6px;max-height:220px;overflow:auto;padding:6px;">
-          <table class="table"><tbody>
-          <?php foreach ($employees as $e): ?>
-            <tr class="assign-row"><td style="width:36px;"><input style="width:auto;" type="checkbox" name="employee_ids[]" value="<?= (int)$e['id'] ?>" <?= in_array((string)$e['discord_id'], $currentVisibility['employees'], true) ? 'checked' : '' ?>></td><td><?= h($e['name']) ?> (<?= h($e['badge_number']) ?>)</td></tr>
-          <?php endforeach; ?>
-          </tbody></table>
-        </div>
-
-        <label>Note</label>
-        <textarea name="leader_notes" rows="4" placeholder="Interne noter om sagen..."><?= h($c['leader_notes'] ?? '') ?></textarea>
-
-        <div style="margin-top:8px;display:flex;gap:8px;flex-wrap:wrap;">
-          <button type="submit">Gem Ændringer</button>
-        </div>
+        <button type="submit" class="btn btn-solid">Tildel ny sagsansvarlig</button>
       </form>
-      <?php else: ?>
-      <h4 style="margin:12px 0 8px 0;">Note</h4>
-      <div style="padding:8px;border:1px solid rgba(255,255,255,.08);border-radius:8px;white-space:pre-wrap;"><?= h((string)($c['leader_notes'] ?? '')) !== '' ? nl2br(h($c['leader_notes'])) : '<span class="muted">Ingen note.</span>' ?></div>
+
+      <form method="post" style="margin-top:8px;display:flex;gap:8px;align-items:end;flex-wrap:wrap;">
+        <input type="hidden" name="action" value="assign_department"/>
+        <input type="hidden" name="case_id" value="<?= (int)$c['id'] ?>"/>
+        <input type="hidden" name="view" value="<?= h($view) ?>"/>
+        <input type="hidden" name="q" value="<?= h($search) ?>"/>
+        <div style="min-width:220px;flex:1;">
+          <label>Tildel afdeling</label>
+          <select name="department" required>
+            <option value="">Vælg afdeling</option>
+            <?php foreach ($departments as $d): ?>
+              <option value="<?= h($d['department']) ?>"><?= h($d['department']) ?></option>
+            <?php endforeach; ?>
+          </select>
+        </div>
+        <button type="submit" class="btn">Tildel afdeling</button>
+      </form>
+
+      <form method="post" style="margin-top:8px;">
+        <input type="hidden" name="action" value="unassign_case"/>
+        <input type="hidden" name="case_id" value="<?= (int)$c['id'] ?>"/>
+        <input type="hidden" name="view" value="<?= h($view) ?>"/>
+        <input type="hidden" name="q" value="<?= h($search) ?>"/>
+        <button type="submit" class="btn">Fradel sag</button>
+      </form>
+      <?php endif; ?>
+
+      <details style="margin-top:14px;">
+        <summary class="btn">SagsLog</summary>
+        <div style="margin-top:8px;border:1px solid var(--border);border-radius:8px;padding:10px;background:#f9fbff;">
+          <?php foreach (($caseLogs[(int)$c['id']] ?? []) as $log): ?>
+            <div style="padding:8px 0;border-bottom:1px solid var(--border);"><?= h($log['log_text']) ?></div>
+          <?php endforeach; ?>
+          <?php if (empty($caseLogs[(int)$c['id']] ?? [])): ?>
+            <div class="muted">Ingen log registreret endnu.</div>
+          <?php endif; ?>
+        </div>
+      </details>
+
+      <?php if ($isArchivedView): ?>
       <form method="post" style="margin-top:12px;">
         <input type="hidden" name="action" value="delete_case"/>
         <input type="hidden" name="case_id" value="<?= (int)$c['id'] ?>"/>
@@ -615,7 +836,7 @@ include __DIR__ . '/_layout.php';
 </div>
 
 <div id="caseModal" class="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:9999;">
-  <div style="max-width:900px;margin:7vh auto;background:#fff;padding:18px;border-radius:8px;max-height:85vh;overflow:auto;position:relative;">
+  <div style="max-width:980px;margin:5vh auto;background:#fff;padding:18px;border-radius:12px;max-height:88vh;overflow:auto;position:relative;box-shadow:0 20px 45px rgba(11,42,74,.22);">
     <button type="button" class="btn" onclick="closeCaseModal()" style="position:absolute;right:12px;top:12px;">Luk</button>
     <div id="caseModalContent"></div>
   </div>
