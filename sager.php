@@ -64,6 +64,14 @@ $db->exec("CREATE TABLE IF NOT EXISTS case_logs (
   log_text TEXT NOT NULL,
   created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 )");
+$db->exec("CREATE TABLE IF NOT EXISTS case_archive_assignments (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  case_id INTEGER NOT NULL,
+  target_type TEXT NOT NULL,
+  target_value TEXT NOT NULL,
+  created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+  UNIQUE(case_id, target_type, target_value)
+)");
 
 $ensureColumn = static function (PDO $db, string $table, string $column, string $definition): void {
   try {
@@ -181,6 +189,23 @@ $formatDate = static function (string $dbDate): string {
 $appendCaseLog = static function (int $caseId, string $text) use ($db): void {
   $stmt = $db->prepare("INSERT INTO case_logs(case_id, log_text) VALUES(?,?)");
   $stmt->execute([$caseId, $text]);
+};
+
+$visibilityPairsForCase = static function (array $visibilityRows): array {
+  $pairs = [];
+  foreach ($visibilityRows as $row) {
+    $type = trim((string)($row['target_type'] ?? ''));
+    $value = trim((string)($row['target_value'] ?? ''));
+    if ($type === '' || $value === '') continue;
+    $pairs[$type . ':' . $value] = ['target_type' => $type, 'target_value' => $value];
+  }
+  return $pairs;
+};
+
+$fetchCaseVisibilityRows = static function (int $caseId) use ($db): array {
+  $stmt = $db->prepare('SELECT target_type,target_value FROM case_visibility WHERE case_id=? ORDER BY id ASC');
+  $stmt->execute([$caseId]);
+  return $stmt->fetchAll();
 };
 
 $nextJournalNumber = static function (string $offenseCode) use ($db): string {
@@ -321,6 +346,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       $stmt->execute([$caseId]);
       $case = $stmt->fetch();
       if ($case && $canAccessCase($case) && (int)($case['archived'] ?? 0) === 0) {
+        $beforeVisibility = $visibilityPairsForCase($fetchCaseVisibilityRows($caseId));
+
         try {
           $up = save_upload('evidence');
           if ($up) {
@@ -334,6 +361,27 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           die('Upload fejl: ' . h($e->getMessage()));
         }
         $saveVisibility($caseId, $employeeIds, $departmentNames);
+
+        $afterVisibility = $visibilityPairsForCase($fetchCaseVisibilityRows($caseId));
+        $dateText = $formatDate(date('Y-m-d H:i:s'));
+
+        foreach ($afterVisibility as $key => $entry) {
+          if (!isset($beforeVisibility[$key])) {
+            $label = $entry['target_type'] === 'employee'
+              ? ($employeeNameByDiscord[$entry['target_value']] ?? $entry['target_value'])
+              : $entry['target_value'];
+            $appendCaseLog($caseId, 'Tildelt: "' . $label . '" - ' . $dateText);
+          }
+        }
+        foreach ($beforeVisibility as $key => $entry) {
+          if (!isset($afterVisibility[$key])) {
+            $label = $entry['target_type'] === 'employee'
+              ? ($employeeNameByDiscord[$entry['target_value']] ?? $entry['target_value'])
+              : $entry['target_value'];
+            $appendCaseLog($caseId, 'Fradelt: "' . $label . '" - ' . $dateText);
+          }
+        }
+
         $db->prepare("UPDATE cases SET status='Påbegyndt' WHERE id=?")->execute([$caseId]);
       }
     }
@@ -364,36 +412,6 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     $redirectToCurrentView();
   }
 
-  if ($action === 'assign_department' && $isLeader) {
-    $caseId = (int)($_POST['case_id'] ?? 0);
-    $dep = trim((string)($_POST['department'] ?? ''));
-    if ($caseId > 0 && $dep !== '') {
-      $stmt = $db->prepare('SELECT * FROM cases WHERE id=?');
-      $stmt->execute([$caseId]);
-      $case = $stmt->fetch();
-      if ($case && $canAccessCase($case)) {
-        $db->prepare("UPDATE cases SET assigned_type='department', assigned_department=?, status='Påbegyndt' WHERE id=?")->execute([$dep, $caseId]);
-        $person = trim((string)($case['responsible_name'] ?? $case['assigned_name'] ?? 'Ukendt'));
-        $appendCaseLog($caseId, 'Sagen blev tildelt "' . $person . '","' . $dep . '" - ' . $formatDate(date('Y-m-d H:i:s')));
-      }
-    }
-    $redirectToCurrentView();
-  }
-
-  if ($action === 'unassign_case' && $isLeader) {
-    $caseId = (int)($_POST['case_id'] ?? 0);
-    if ($caseId > 0) {
-      $stmt = $db->prepare('SELECT * FROM cases WHERE id=?');
-      $stmt->execute([$caseId]);
-      $case = $stmt->fetch();
-      if ($case && $canAccessCase($case)) {
-        $person = trim((string)($case['responsible_name'] ?? $case['assigned_name'] ?? 'Ukendt'));
-        $db->prepare("UPDATE cases SET assigned_type='person', assigned_department=NULL, status='Påbegyndt' WHERE id=?")->execute([$caseId]);
-        $appendCaseLog($caseId, 'Sagen blev fradelt "' . $person . '" - ' . $formatDate(date('Y-m-d H:i:s')));
-      }
-    }
-    $redirectToCurrentView();
-  }
 
   if ($action === 'send_message') {
     $caseId = (int)($_POST['case_id'] ?? 0);
@@ -413,7 +431,14 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $stmt->execute([$caseId, (string)($u['discord_id'] ?? ''), $myDisplayName, $senderLabel, $senderType, $message]);
       }
     }
-    $redirectToCurrentView();
+
+    $viewRaw = (string)($_POST['view'] ?? $_GET['view'] ?? 'mine');
+    $allowed = ['mine','all','archive','global_archive'];
+    $viewParam = in_array($viewRaw, $allowed, true) ? $viewRaw : 'mine';
+    $qs = ['view=' . urlencode($viewParam), 'open_case=' . urlencode((string)$caseId)];
+    $qVal = trim((string)($_POST['q'] ?? $_GET['q'] ?? ''));
+    if ($qVal !== '') $qs[] = 'q=' . urlencode($qVal);
+    redirect('sager.php?' . implode('&', $qs));
   }
 
   if ($action === 'delete_evidence') {
@@ -440,14 +465,36 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   if ($action === 'archive_case') {
     $caseId = (int)($_POST['case_id'] ?? 0);
     if ($caseId > 0) {
-      $stmt = $db->prepare('SELECT file_path FROM case_evidence WHERE case_id=?');
+      $stmt = $db->prepare('SELECT * FROM cases WHERE id=?');
       $stmt->execute([$caseId]);
-      foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $ev) {
-        $abs = __DIR__ . '/' . ltrim((string)$ev, '/');
-        if (is_file($abs)) { try { unlink($abs); } catch (Throwable $_) {} }
+      $case = $stmt->fetch();
+      if ($case && $canAccessCase($case)) {
+        $stmt = $db->prepare('SELECT file_path FROM case_evidence WHERE case_id=?');
+        $stmt->execute([$caseId]);
+        foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $ev) {
+          $abs = __DIR__ . '/' . ltrim((string)$ev, '/');
+          if (is_file($abs)) { try { unlink($abs); } catch (Throwable $_) {} }
+        }
+        $db->prepare('DELETE FROM case_evidence WHERE case_id=?')->execute([$caseId]);
+
+        $db->prepare('DELETE FROM case_archive_assignments WHERE case_id=?')->execute([$caseId]);
+        $visibilityRows = $fetchCaseVisibilityRows($caseId);
+        $insArchiveAssignment = $db->prepare('INSERT OR IGNORE INTO case_archive_assignments(case_id,target_type,target_value) VALUES(?,?,?)');
+        foreach ($visibilityRows as $row) {
+          $type = trim((string)($row['target_type'] ?? ''));
+          $value = trim((string)($row['target_value'] ?? ''));
+          if ($type !== '' && $value !== '') {
+            $insArchiveAssignment->execute([$caseId, $type, $value]);
+          }
+        }
+
+        $responsibleDiscord = trim((string)($case['responsible_discord_id'] ?? $case['assigned_discord_id'] ?? ''));
+        if ($responsibleDiscord !== '') {
+          $insArchiveAssignment->execute([$caseId, 'employee', $responsibleDiscord]);
+        }
+
+        $db->prepare("UPDATE cases SET archived=1, status='Lukket', evidence_path=NULL WHERE id=?")->execute([$caseId]);
       }
-      $db->prepare('DELETE FROM case_evidence WHERE case_id=?')->execute([$caseId]);
-      $db->prepare("UPDATE cases SET archived=1, status='Lukket', evidence_path=NULL WHERE id=?")->execute([$caseId]);
     }
     redirect('sager.php');
   }
@@ -482,8 +529,10 @@ $search = trim((string)($_GET['q'] ?? ''));
 $isGlobalArchiveView = $view === 'global_archive';
 $isPersonalArchiveView = $view === 'archive';
 $isArchivedView = $isGlobalArchiveView || $isPersonalArchiveView;
+$openCaseId = (int)($_GET['open_case'] ?? 0);
 
 $visibleCaseIds = [];
+$archivedVisibleCaseIds = [];
 $visParams = [];
 $visParts = [];
 if ($myDiscordIds) {
@@ -500,14 +549,17 @@ if ($visParts) {
   $stmt = $db->prepare('SELECT DISTINCT case_id FROM case_visibility WHERE ' . implode(' OR ', $visParts));
   $stmt->execute($visParams);
   $visibleCaseIds = array_map(static fn($r) => (int)$r['case_id'], $stmt->fetchAll());
+
+  $stmt = $db->prepare('SELECT DISTINCT case_id FROM case_archive_assignments WHERE ' . implode(' OR ', $visParts));
+  $stmt->execute($visParams);
+  $archivedVisibleCaseIds = array_map(static fn($r) => (int)$r['case_id'], $stmt->fetchAll());
 }
 
 $where = ['archived=' . ($isArchivedView ? '1' : '0')];
 $params = [];
 
-if (($view === 'mine' || $view === 'archive') && !$isLeader) {
-  $accessParts = ['created_by_discord_id=?', "(assigned_type='person' AND assigned_discord_id=?)", 'responsible_discord_id=?'];
-  $params[] = (string)$u['discord_id'];
+if ($view === 'mine' && !$isLeader) {
+  $accessParts = ["(assigned_type='person' AND assigned_discord_id=?)", 'responsible_discord_id=?'];
   $params[] = (string)$u['discord_id'];
   $params[] = (string)$u['discord_id'];
 
@@ -522,6 +574,34 @@ if (($view === 'mine' || $view === 'archive') && !$isLeader) {
     $params = array_merge($params, $visibleCaseIds);
   }
   $where[] = '(' . implode(' OR ', $accessParts) . ')';
+}
+
+if ($view === 'archive' && !$isLeader) {
+  $archiveParts = [];
+  if ($archivedVisibleCaseIds) {
+    $ph = implode(',', array_fill(0, count($archivedVisibleCaseIds), '?'));
+    $archiveParts[] = "id IN ($ph)";
+    $params = array_merge($params, $archivedVisibleCaseIds);
+  }
+  if (!$archiveParts) {
+    $where[] = '1=0';
+  } else {
+    $where[] = '(' . implode(' OR ', $archiveParts) . ')';
+  }
+}
+
+if ($view === 'global_archive' && !$isLeader) {
+  $globalArchiveParts = [];
+  if ($archivedVisibleCaseIds) {
+    $ph = implode(',', array_fill(0, count($archivedVisibleCaseIds), '?'));
+    $globalArchiveParts[] = "id IN ($ph)";
+    $params = array_merge($params, $archivedVisibleCaseIds);
+  }
+  if (!$globalArchiveParts) {
+    $where[] = '1=0';
+  } else {
+    $where[] = '(' . implode(' OR ', $globalArchiveParts) . ')';
+  }
 }
 
 if ($search !== '') {
@@ -596,7 +676,7 @@ include __DIR__ . '/_layout.php';
         <label>Bevismateriale (valgfri)</label>
         <input type="file" name="evidence" accept="image/*,.pdf,.txt,.zip,.rar,.7z,.doc,.docx">
 
-        <label>Synlig for afdelinger</label>
+        <label>Tildel afdelinger</label>
         <input type="text" class="assign-filter" placeholder="Søg afdeling...">
         <div data-filter-list class="picker-list">
           <table class="table"><tbody>
@@ -606,7 +686,7 @@ include __DIR__ . '/_layout.php';
           </tbody></table>
         </div>
 
-        <label>Synlig for medarbejdere</label>
+        <label>Tildel medarbejder</label>
         <input type="text" class="assign-filter" placeholder="Søg medarbejder...">
         <div data-filter-list class="picker-list">
           <table class="table"><tbody>
@@ -721,14 +801,40 @@ include __DIR__ . '/_layout.php';
 
       <h4 style="margin:12px 0 8px 0;">Bevismateriale</h4>
       <?php if (!$isArchivedView): ?>
-      <form method="post" enctype="multipart/form-data" style="margin:0 0 10px 0;padding:10px;border:1px solid var(--border);border-radius:8px;display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+      <form method="post" enctype="multipart/form-data" style="margin:0 0 10px 0;padding:10px;border:1px solid var(--border);border-radius:8px;">
         <input type="hidden" name="action" value="save_case_changes"/>
         <input type="hidden" name="case_id" value="<?= (int)$c['id'] ?>"/>
         <input type="hidden" name="view" value="<?= h($view) ?>"/>
         <input type="hidden" name="q" value="<?= h($search) ?>"/>
-        <input type="text" name="new_evidence_title" placeholder="Titel på bilag" style="min-width:220px;">
-        <input type="file" name="evidence" accept="image/*,.pdf,.txt,.zip,.rar,.7z,.doc,.docx" required>
-        <button type="submit" class="btn btn-solid">Tilføj bilag</button>
+
+        <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
+          <input type="text" name="new_evidence_title" placeholder="Titel på bilag" style="min-width:220px;">
+          <input type="file" name="evidence" accept="image/*,.pdf,.txt,.zip,.rar,.7z,.doc,.docx">
+        </div>
+
+        <label style="margin-top:10px;">Tildel afdelinger</label>
+        <input type="text" class="assign-filter" placeholder="Søg afdeling...">
+        <div data-filter-list class="picker-list">
+          <table class="table"><tbody>
+          <?php foreach ($departments as $d): ?>
+            <?php $depName = (string)$d['department']; ?>
+            <tr class="assign-row"><td style="width:36px;"><input style="width:auto;" type="checkbox" name="assigned_departments[]" value="<?= h($depName) ?>" <?= in_array($depName, ($cvm['departments'] ?? []), true) ? 'checked' : '' ?>></td><td><?= h($depName) ?></td></tr>
+          <?php endforeach; ?>
+          </tbody></table>
+        </div>
+
+        <label style="margin-top:10px;">Tildel medarbejder</label>
+        <input type="text" class="assign-filter" placeholder="Søg medarbejder...">
+        <div data-filter-list class="picker-list">
+          <table class="table"><tbody>
+          <?php foreach ($employees as $e): ?>
+            <?php $did = trim((string)($e['discord_id'] ?? '')); ?>
+            <tr class="assign-row"><td style="width:36px;"><input style="width:auto;" type="checkbox" name="employee_ids[]" value="<?= (int)$e['id'] ?>" <?= ($did !== '' && in_array($did, ($cvm['employees'] ?? []), true)) ? 'checked' : '' ?>></td><td><?= h($e['name']) ?> (<?= h($e['badge_number']) ?>)</td></tr>
+          <?php endforeach; ?>
+          </tbody></table>
+        </div>
+
+        <button type="submit" class="btn btn-solid" style="margin-top:10px;">Gem ændringer</button>
       </form>
       <?php endif; ?>
       <table class="table">
@@ -783,31 +889,6 @@ include __DIR__ . '/_layout.php';
         </div>
         <button type="submit" class="btn btn-solid">Tildel ny sagsansvarlig</button>
       </form>
-
-      <form method="post" style="margin-top:8px;display:flex;gap:8px;align-items:end;flex-wrap:wrap;">
-        <input type="hidden" name="action" value="assign_department"/>
-        <input type="hidden" name="case_id" value="<?= (int)$c['id'] ?>"/>
-        <input type="hidden" name="view" value="<?= h($view) ?>"/>
-        <input type="hidden" name="q" value="<?= h($search) ?>"/>
-        <div style="min-width:220px;flex:1;">
-          <label>Tildel afdeling</label>
-          <select name="department" required>
-            <option value="">Vælg afdeling</option>
-            <?php foreach ($departments as $d): ?>
-              <option value="<?= h($d['department']) ?>"><?= h($d['department']) ?></option>
-            <?php endforeach; ?>
-          </select>
-        </div>
-        <button type="submit" class="btn">Tildel afdeling</button>
-      </form>
-
-      <form method="post" style="margin-top:8px;">
-        <input type="hidden" name="action" value="unassign_case"/>
-        <input type="hidden" name="case_id" value="<?= (int)$c['id'] ?>"/>
-        <input type="hidden" name="view" value="<?= h($view) ?>"/>
-        <input type="hidden" name="q" value="<?= h($search) ?>"/>
-        <button type="submit" class="btn">Fradel sag</button>
-      </form>
       <?php endif; ?>
 
       <details style="margin-top:14px;">
@@ -843,6 +924,8 @@ include __DIR__ . '/_layout.php';
 </div>
 
 <script>
+const openCaseFromQuery = <?= $openCaseId > 0 ? (int)$openCaseId : 0 ?>;
+
 function setupAssignmentFilters(root) {
   const scope = root || document;
   const filters = scope.querySelectorAll('.assign-filter');
@@ -879,6 +962,9 @@ window.addEventListener('click', function(e){
   if (e.target === modal) closeCaseModal();
 });
 setupAssignmentFilters(document);
+if (openCaseFromQuery > 0) {
+  openCaseModal(openCaseFromQuery);
+}
 </script>
 
 <footer class="footer">© 2026 Redline Politidistrikt — FiveM Roleplay Server</footer>
