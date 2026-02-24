@@ -277,6 +277,35 @@ $saveVisibility = static function (int $caseId, array $employeeIds, array $depar
   }
 };
 
+$isEmployeeCoveredByVisibility = static function (string $discordId, array $visibilityRows) use ($employees): bool {
+  $discordId = trim($discordId);
+  if ($discordId === '') return false;
+
+  $visibleEmployees = [];
+  $visibleDepartments = [];
+  foreach ($visibilityRows as $row) {
+    $type = trim((string)($row['target_type'] ?? ''));
+    $value = trim((string)($row['target_value'] ?? ''));
+    if ($type === 'employee' && $value !== '') $visibleEmployees[] = $value;
+    if ($type === 'department' && $value !== '') $visibleDepartments[] = $value;
+  }
+
+  if (in_array($discordId, $visibleEmployees, true)) return true;
+  if (!$visibleDepartments) return false;
+
+  foreach ($employees as $employee) {
+    $did = trim((string)($employee['discord_id'] ?? ''));
+    if ($did !== $discordId) continue;
+
+    $department = trim((string)($employee['department'] ?? ''));
+    $secondaryDepartment = trim((string)($employee['secondary_department'] ?? ''));
+    if ($department !== '' && in_array($department, $visibleDepartments, true)) return true;
+    if ($secondaryDepartment !== '' && in_array($secondaryDepartment, $visibleDepartments, true)) return true;
+  }
+
+  return false;
+};
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
   $action = $_POST['action'] ?? '';
 
@@ -441,10 +470,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         $newDid = trim((string)($emp['discord_id'] ?? ''));
         $newName = trim((string)($emp['name'] ?? ''));
         $newBadge = trim((string)($emp['badge_number'] ?? ''));
+        $oldDid = trim((string)($case['responsible_discord_id'] ?? $case['assigned_discord_id'] ?? ''));
         $oldName = trim((string)($case['responsible_name'] ?? $case['assigned_name'] ?? 'Ukendt'));
 
         $db->prepare("UPDATE cases SET responsible_discord_id=?, responsible_name=?, responsible_badge=?, assigned_discord_id=?, assigned_name=?, assigned_badge=?, status='Påbegyndt' WHERE id=?")
           ->execute([$newDid, $newName, $newBadge, $newDid, $newName, $newBadge, $caseId]);
+
+        $insArchiveAssignment = $db->prepare('INSERT OR IGNORE INTO case_archive_assignments(case_id,target_type,target_value) VALUES(?,?,?)');
+        if ($newDid !== '') {
+          $insArchiveAssignment->execute([$caseId, 'employee', $newDid]);
+          $db->prepare("INSERT OR IGNORE INTO case_visibility(case_id,target_type,target_value) VALUES(?, 'employee', ?)")
+            ->execute([$caseId, $newDid]);
+        }
+
+        if ($oldDid !== '' && $oldDid !== $newDid) {
+          $db->prepare("DELETE FROM case_visibility WHERE case_id=? AND target_type='employee' AND target_value=?")
+            ->execute([$caseId, $oldDid]);
+
+          $visibilityRows = $fetchCaseVisibilityRows($caseId);
+          $oldStillAssigned = $isEmployeeCoveredByVisibility($oldDid, $visibilityRows);
+          if (!$oldStillAssigned) {
+            $db->prepare("DELETE FROM case_archive_assignments WHERE case_id=? AND target_type='employee' AND target_value=?")
+              ->execute([$caseId, $oldDid]);
+          }
+        }
 
         $dateText = $formatDate(date('Y-m-d H:i:s'));
         $appendCaseLog($caseId, '"' . $oldName . '" fik fradelt Sagsansvarlighed "' . $newName . '" fik tildelt Sagsansvarlighed - ' . $dateText);
@@ -637,14 +686,29 @@ $where = ['archived=' . ($isArchivedView ? '1' : '0')];
 $params = [];
 
 if ($view === 'mine' && !$isLeader) {
-  $accessParts = ["(assigned_type='person' AND assigned_discord_id=?)", 'responsible_discord_id=?'];
+  $accessParts = [
+    "(assigned_type='person' AND assigned_discord_id=?)",
+    'responsible_discord_id=?'
+  ];
   $params[] = (string)$u['discord_id'];
   $params[] = (string)$u['discord_id'];
+
+  if ($myName !== '' && $myBadge !== '') {
+    $accessParts[] = "(assigned_type='person' AND assigned_name=? AND assigned_badge=?)";
+    $accessParts[] = '(responsible_name=? AND responsible_badge=?)';
+    array_push($params, $myName, $myBadge, $myName, $myBadge);
+  }
 
   if ($myDepartments) {
     $ph = implode(',', array_fill(0, count($myDepartments), '?'));
     $accessParts[] = "(assigned_type='department' AND assigned_department IN ($ph))";
     $params = array_merge($params, $myDepartments);
+  }
+
+  if ($visibleCaseIds) {
+    $ph = implode(',', array_fill(0, count($visibleCaseIds), '?'));
+    $accessParts[] = "id IN ($ph)";
+    $params = array_merge($params, $visibleCaseIds);
   }
   $where[] = '(' . implode(' OR ', $accessParts) . ')';
 }
