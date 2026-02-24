@@ -296,7 +296,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     }
 
     if ($title === '' && $selectedType !== '') {
-      $title = 'G*' . $selectedType;
+      $title = $selectedType;
     }
 
     if ($title !== '' && $description !== '' && $selectedType !== '' && $offenseCode !== '') {
@@ -646,11 +646,6 @@ if ($view === 'mine' && !$isLeader) {
     $accessParts[] = "(assigned_type='department' AND assigned_department IN ($ph))";
     $params = array_merge($params, $myDepartments);
   }
-  if ($visibleCaseIds) {
-    $ph = implode(',', array_fill(0, count($visibleCaseIds), '?'));
-    $accessParts[] = "id IN ($ph)";
-    $params = array_merge($params, $visibleCaseIds);
-  }
   $where[] = '(' . implode(' OR ', $accessParts) . ')';
 }
 
@@ -696,6 +691,10 @@ if ($search !== '') {
 $stmt = $db->prepare('SELECT * FROM cases WHERE ' . implode(' AND ', $where) . ' ORDER BY id DESC');
 $stmt->execute($params);
 $visibleCases = $stmt->fetchAll();
+$caseAccessMap = [];
+foreach ($visibleCases as $row) {
+  $caseAccessMap[(int)$row['id']] = $canAccessCase($row);
+}
 
 $caseVisibility = [];
 $caseEvidence = [];
@@ -743,8 +742,6 @@ include __DIR__ . '/_layout.php';
       <summary class="btn btn-solid">+ Opret sag</summary>
       <form method="post" enctype="multipart/form-data" style="margin-top:12px">
         <input type="hidden" name="action" value="create_case"/>
-        <label>Titel</label>
-        <input name="title" readonly placeholder="Bliver sat automatisk ud fra type">
         <label>Type</label>
         <select name="case_type_text" required data-case-type-select data-title-target="title">
           <option value="">Vælg type...</option>
@@ -752,6 +749,9 @@ include __DIR__ . '/_layout.php';
             <option value="<?= h($t['GERNINGTXT']) ?>"><?= h($t['GERNINGTXT']) ?> (<?= h($t['GERNINGSKODE']) ?>)</option>
           <?php endforeach; ?>
         </select>
+        </select>
+        <label>Titel</label>
+        <input name="title" readonly placeholder="Bliver sat automatisk ud fra type">
         <label>Beskrivelse</label>
         <textarea name="description" rows="4" required></textarea>
         <label>Bevis titel (valgfri)</label>
@@ -829,8 +829,13 @@ include __DIR__ . '/_layout.php';
           <td><?= h((string)($c['case_type_text'] ?? 'Ukendt')) ?> / <?= h((string)($c['offense_code'] ?? '-')) ?></td>
           <td><?= h($c['status']) ?></td>
           <td>
+           <?php $canOpenCase = $isLeader || !empty($caseAccessMap[(int)$c['id']]); ?>
+            <?php if ($canOpenCase): ?>
             <button class="btn" type="button" onclick="openCaseModal(<?= (int)$c['id'] ?>)">Åben</button>
-            <?php if (!$isArchivedView): ?>
+            <?php else: ?>
+            <button class="btn" type="button" disabled>Ingen adgang</button>
+            <?php endif; ?>
+            <?php if (!$isArchivedView && $canOpenCase): ?>
             <form method="post" style="display:inline-block;">
               <input type="hidden" name="action" value="archive_case"/>
               <input type="hidden" name="case_id" value="<?= (int)$c['id'] ?>"/>
@@ -900,7 +905,8 @@ include __DIR__ . '/_layout.php';
       <?php endif; ?>
 
       <h4 style="margin:12px 0 8px 0;">Bevismateriale</h4>
-      <?php if (!$isArchivedView): ?>
+      <?php $canOpenCase = $isLeader || !empty($caseAccessMap[(int)$c['id']]); ?>
+      <?php if (!$isArchivedView && $canOpenCase): ?>
       <form method="post" enctype="multipart/form-data" style="margin:0 0 10px 0;padding:10px;border:1px solid var(--border);border-radius:8px;">
         <input type="hidden" name="action" value="save_case_changes"/>
         <input type="hidden" name="case_id" value="<?= (int)$c['id'] ?>"/>
@@ -909,7 +915,8 @@ include __DIR__ . '/_layout.php';
 
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
           <input type="text" name="new_evidence_title" placeholder="Titel på bilag" style="min-width:220px;">
-          <input type="file" name="evidence" accept="image/*,.pdf,.txt,.zip,.rar,.7z,.doc,.docx" data-autosubmit-evidence>
+          <input type="file" name="evidence" accept="image/*,.pdf,.txt,.zip,.rar,.7z,.doc,.docx">
+          <button type="submit" class="btn">Upload bilag</button>
         </div>
         <?php $responsibleDiscordCase = trim((string)($c['responsible_discord_id'] ?? $c['assigned_discord_id'] ?? '')); ?>
         <?php if ($responsibleDiscordCase === (string)($u['discord_id'] ?? '')): ?>
@@ -935,7 +942,7 @@ include __DIR__ . '/_layout.php';
           </tbody></table>
         </div>
 
-        <<button type="submit" class="btn btn-solid" style="margin-top:10px;">Gem ændringer</button>
+        <button type="submit" class="btn btn-solid" style="margin-top:10px;">Gem tildelinger</button>
         <?php endif; ?>
       </form>
       <?php endif; ?>
@@ -1070,23 +1077,15 @@ function openCaseModal(id) {
   const content = document.getElementById('caseModalContent');
   if (!src || !modal || !content) return;
   content.innerHTML = src.innerHTML;
+  content.querySelectorAll('.assign-filter').forEach(function(input){
+    input.dataset.bound = '';
+  });
   modal.style.display = 'block';
   setupAssignmentFilters(content);
 }
 function closeCaseModal() {
   const modal = document.getElementById('caseModal');
   if (modal) modal.style.display = 'none';
-}
-function bindAutoEvidenceSubmit(root) {
-  (root || document).querySelectorAll('[data-autosubmit-evidence]').forEach(function(input){
-    if (input.dataset.bound === '1') return;
-    input.dataset.bound = '1';
-    input.addEventListener('change', function(){
-      if (!input.files || input.files.length === 0) return;
-      const form = input.closest('form');
-      if (form) form.submit();
-    });
-  });
 }
 function bindCreateTitleFromType(root) {
   (root || document).querySelectorAll('[data-case-type-select]').forEach(function(sel){
@@ -1097,7 +1096,7 @@ function bindCreateTitleFromType(root) {
     if (!titleInput) return;
     const setTitle = function(){
       const v = (sel.value || '').trim();
-      titleInput.value = v ? ('G*' + v) : '';
+     titleInput.value = v;
     };
     sel.addEventListener('change', setTitle);
     setTitle();
@@ -1121,7 +1120,6 @@ window.addEventListener('click', function(e){
   if (e.target === henlaeg) closeHenlaegModal();
 });
 setupAssignmentFilters(document);
-bindAutoEvidenceSubmit(document);
 bindCreateTitleFromType(document);
 if (openCaseFromQuery > 0) {
   openCaseModal(openCaseFromQuery);
