@@ -89,6 +89,8 @@ $ensureColumn($db, 'cases', 'responsible_badge', 'TEXT');
 $ensureColumn($db, 'cases', 'case_type_text', 'TEXT');
 $ensureColumn($db, 'cases', 'offense_code', 'TEXT');
 $ensureColumn($db, 'cases', 'journal_number', 'TEXT');
+$ensureColumn($db, 'cases', 'archive_bucket', "TEXT NOT NULL DEFAULT 'stam'");
+$ensureColumn($db, 'cases', 'henlagt_reason', 'TEXT');
 $ensureColumn($db, 'users', 'police_display_name', 'TEXT');
 $ensureColumn($db, 'users', 'police_badge_number', 'TEXT');
 $ensureColumn($db, 'employees', 'secondary_department', 'TEXT');
@@ -176,6 +178,8 @@ $redirectToCurrentView = static function (): void {
   $allowed = ['mine','all','archive','global_archive'];
   $viewParam = in_array($viewRaw, $allowed, true) ? $viewRaw : 'mine';
   $qs = ['view=' . urlencode($viewParam)];
+  $archiveTab = trim((string)($_POST['archive_tab'] ?? $_GET['archive_tab'] ?? 'stam'));
+  if (in_array($archiveTab, ['stam', 'henlagt'], true)) $qs[] = 'archive_tab=' . urlencode($archiveTab);
   $qVal = trim((string)($_POST['q'] ?? $_GET['q'] ?? ''));
   if ($qVal !== '') $qs[] = 'q=' . urlencode($qVal);
   redirect('sager.php?' . implode('&', $qs));
@@ -291,6 +295,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       }
     }
 
+    if ($title === '' && $selectedType !== '') {
+      $title = 'G*' . $selectedType;
+    }
+
     if ($title !== '' && $description !== '' && $selectedType !== '' && $offenseCode !== '') {
       $journal = $nextJournalNumber($offenseCode);
       $uid = 'S-' . date('ymd') . '-' . substr(str_shuffle('ABCDEFGHJKLMNPQRSTUVWXYZ0123456789'), 0, 4);
@@ -319,17 +327,46 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       $appendCaseLog($newCaseId, 'Sagen blev oprettet af "' . $myDisplayName . '" - ' . $formatDate(date('Y-m-d H:i:s')));
 
       $evidenceTitle = trim((string)($_POST['evidence_title'] ?? ''));
-      try {
-        $evidencePath = save_upload('evidence');
-        if ($evidencePath) {
-          $safePath = $normalizeUploadPath($evidencePath);
-          if ($safePath !== '') {
-            $stmt = $db->prepare("INSERT INTO case_evidence(case_id, title, file_path, original_name) VALUES(?,?,?,?)");
-            $stmt->execute([$newCaseId, ($evidenceTitle !== '' ? $evidenceTitle : 'Bevismateriale'), $safePath, basename((string)($_FILES['evidence']['name'] ?? $safePath))]);
+      if (!empty($_FILES['evidence']['name']) && is_array($_FILES['evidence']['name'])) {
+        $count = count((array)$_FILES['evidence']['name']);
+        for ($i = 0; $i < $count; $i++) {
+          if ((int)($_FILES['evidence']['error'][$i] ?? UPLOAD_ERR_NO_FILE) === UPLOAD_ERR_NO_FILE) continue;
+          $single = [
+            'name' => $_FILES['evidence']['name'][$i] ?? '',
+            'type' => $_FILES['evidence']['type'][$i] ?? '',
+            'tmp_name' => $_FILES['evidence']['tmp_name'][$i] ?? '',
+            'error' => $_FILES['evidence']['error'][$i] ?? UPLOAD_ERR_NO_FILE,
+            'size' => $_FILES['evidence']['size'][$i] ?? 0,
+          ];
+          $orig = $_FILES['evidence'] ?? null;
+          $_FILES['evidence'] = $single;
+          try {
+            $evidencePath = save_upload('evidence');
+            if ($evidencePath) {
+              $safePath = $normalizeUploadPath($evidencePath);
+              if ($safePath !== '') {
+                $stmt = $db->prepare("INSERT INTO case_evidence(case_id, title, file_path, original_name) VALUES(?,?,?,?)");
+                $stmt->execute([$newCaseId, ($evidenceTitle !== '' ? $evidenceTitle : 'Bevismateriale'), $safePath, basename((string)$single['name'] ?: $safePath)]);
+              }
+            }
+          } catch (Throwable $e) {
+            die('Upload fejl: ' . h($e->getMessage()));
           }
+          $_FILES['evidence'] = $orig;
         }
-      } catch (Throwable $e) {
-        die('Upload fejl: ' . h($e->getMessage()));
+      } else {
+        try {
+          $evidencePath = save_upload('evidence');
+          if ($evidencePath) {
+            $safePath = $normalizeUploadPath($evidencePath);
+            if ($safePath !== '') {
+              $stmt = $db->prepare("INSERT INTO case_evidence(case_id, title, file_path, original_name) VALUES(?,?,?,?)");
+              $stmt->execute([$newCaseId, ($evidenceTitle !== '' ? $evidenceTitle : 'Bevismateriale'), $safePath, basename((string)($_FILES['evidence']['name'] ?? $safePath))]);
+            }
+          }
+        } catch (Throwable $e) {
+          die('Upload fejl: ' . h($e->getMessage()));
+        }
       }
     }
     redirect('sager.php');
@@ -346,6 +383,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       $stmt->execute([$caseId]);
       $case = $stmt->fetch();
       if ($case && $canAccessCase($case) && (int)($case['archived'] ?? 0) === 0) {
+        $responsibleDiscord = trim((string)($case['responsible_discord_id'] ?? $case['assigned_discord_id'] ?? ''));
+        $canManageAssignments = $responsibleDiscord !== '' && $responsibleDiscord === (string)($u['discord_id'] ?? '');
         $beforeVisibility = $visibilityPairsForCase($fetchCaseVisibilityRows($caseId));
 
         try {
@@ -360,7 +399,9 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         } catch (Throwable $e) {
           die('Upload fejl: ' . h($e->getMessage()));
         }
-        $saveVisibility($caseId, $employeeIds, $departmentNames);
+        if ($canManageAssignments) {
+          $saveVisibility($caseId, $employeeIds, $departmentNames);
+        }
 
         $afterVisibility = $visibilityPairsForCase($fetchCaseVisibilityRows($caseId));
         $dateText = $formatDate(date('Y-m-d H:i:s'));
@@ -370,7 +411,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $label = $entry['target_type'] === 'employee'
               ? ($employeeNameByDiscord[$entry['target_value']] ?? $entry['target_value'])
               : $entry['target_value'];
-            $appendCaseLog($caseId, 'Tildelt: "' . $label . '" - ' . $dateText);
+            $appendCaseLog($caseId, 'Tildelt af "' . $myDisplayName . '": "' . $label . '" - ' . $dateText);
           }
         }
         foreach ($beforeVisibility as $key => $entry) {
@@ -378,7 +419,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
             $label = $entry['target_type'] === 'employee'
               ? ($employeeNameByDiscord[$entry['target_value']] ?? $entry['target_value'])
               : $entry['target_value'];
-            $appendCaseLog($caseId, 'Fradelt: "' . $label . '" - ' . $dateText);
+            $appendCaseLog($caseId, 'Fradelt af "' . $myDisplayName . '": "' . $label . '" - ' . $dateText);
           }
         }
 
@@ -469,13 +510,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
       $stmt->execute([$caseId]);
       $case = $stmt->fetch();
       if ($case && $canAccessCase($case)) {
-        $stmt = $db->prepare('SELECT file_path FROM case_evidence WHERE case_id=?');
-        $stmt->execute([$caseId]);
-        foreach ($stmt->fetchAll(PDO::FETCH_COLUMN) as $ev) {
-          $abs = __DIR__ . '/' . ltrim((string)$ev, '/');
-          if (is_file($abs)) { try { unlink($abs); } catch (Throwable $_) {} }
-        }
-        $db->prepare('DELETE FROM case_evidence WHERE case_id=?')->execute([$caseId]);
+
 
         $db->prepare('DELETE FROM case_archive_assignments WHERE case_id=?')->execute([$caseId]);
         $visibilityRows = $fetchCaseVisibilityRows($caseId);
@@ -493,10 +528,51 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
           $insArchiveAssignment->execute([$caseId, 'employee', $responsibleDiscord]);
         }
 
-        $db->prepare("UPDATE cases SET archived=1, status='Lukket', evidence_path=NULL WHERE id=?")->execute([$caseId]);
+        $db->prepare("UPDATE cases SET archived=1, status='Arkiveret/Lukket', archive_bucket='stam', evidence_path=NULL, henlagt_reason=NULL WHERE id=?")->execute([$caseId]);
       }
     }
     redirect('sager.php');
+  }
+
+  if ($action === 'reopen_case') {
+    $caseId = (int)($_POST['case_id'] ?? 0);
+    if ($caseId > 0) {
+      $stmt = $db->prepare('SELECT * FROM cases WHERE id=?');
+      $stmt->execute([$caseId]);
+      $case = $stmt->fetch();
+      if ($case && $canAccessCase($case) && (string)($case['archive_bucket'] ?? 'stam') !== 'henlagt') {
+        $db->prepare('DELETE FROM case_visibility WHERE case_id=?')->execute([$caseId]);
+        $stmt = $db->prepare('SELECT target_type,target_value FROM case_archive_assignments WHERE case_id=? ORDER BY id ASC');
+        $stmt->execute([$caseId]);
+        $ins = $db->prepare('INSERT OR IGNORE INTO case_visibility(case_id,target_type,target_value) VALUES(?,?,?)');
+        $restoredResponsible = trim((string)($case['responsible_discord_id'] ?? $case['assigned_discord_id'] ?? ''));
+        foreach ($stmt->fetchAll() as $row) {
+          $type = trim((string)($row['target_type'] ?? ''));
+          $value = trim((string)($row['target_value'] ?? ''));
+          if ($type === '' || $value === '') continue;
+          $ins->execute([$caseId, $type, $value]);
+        }
+        $respName = $employeeNameByDiscord[$restoredResponsible] ?? trim((string)($case['responsible_name'] ?? ''));
+        $respBadge = $employeeBadgeByDiscord[$restoredResponsible] ?? trim((string)($case['responsible_badge'] ?? ''));
+        $db->prepare("UPDATE cases SET archived=0, archive_bucket='stam', henlagt_reason=NULL, status='Påbegyndt', responsible_discord_id=?, responsible_name=?, responsible_badge=?, assigned_discord_id=?, assigned_name=?, assigned_badge=? WHERE id=?")
+          ->execute([$restoredResponsible, $respName, $respBadge, $restoredResponsible, $respName, $respBadge, $caseId]);
+      }
+    }
+    $redirectToCurrentView();
+  }
+
+  if ($action === 'henlaeg_case') {
+    $caseId = (int)($_POST['case_id'] ?? 0);
+    $reason = trim((string)($_POST['henlagt_reason'] ?? ''));
+    if ($caseId > 0 && $reason !== '') {
+      $stmt = $db->prepare('SELECT * FROM cases WHERE id=?');
+      $stmt->execute([$caseId]);
+      $case = $stmt->fetch();
+      if ($case && $canAccessCase($case) && (int)($case['archived'] ?? 0) === 1) {
+        $db->prepare("UPDATE cases SET archive_bucket='henlagt', status='Henlagt', henlagt_reason=? WHERE id=?")->execute([$reason, $caseId]);
+      }
+    }
+    $redirectToCurrentView();
   }
 
   if ($action === 'delete_case') {
@@ -525,6 +601,8 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
 $viewRaw = (string)($_GET['view'] ?? 'mine');
 $view = in_array($viewRaw, ['mine','all','archive','global_archive'], true) ? $viewRaw : 'mine';
+$archiveTabRaw = (string)($_GET['archive_tab'] ?? 'stam');
+$archiveTab = in_array($archiveTabRaw, ['stam', 'henlagt'], true) ? $archiveTabRaw : 'stam';
 $search = trim((string)($_GET['q'] ?? ''));
 $isGlobalArchiveView = $view === 'global_archive';
 $isPersonalArchiveView = $view === 'archive';
@@ -604,6 +682,11 @@ if ($view === 'global_archive' && !$isLeader) {
   }
 }
 
+if ($view === 'global_archive') {
+  $where[] = 'COALESCE(archive_bucket,\'stam\') = ?';
+  $params[] = $archiveTab;
+}
+
 if ($search !== '') {
   $where[] = "(journal_number LIKE ? OR case_uid LIKE ? OR title LIKE ? OR description LIKE ? OR COALESCE(created_by_name,'') LIKE ? OR COALESCE(created_by_discord_id,'') LIKE ?)";
   $like = '%' . $search . '%';
@@ -661,9 +744,9 @@ include __DIR__ . '/_layout.php';
       <form method="post" enctype="multipart/form-data" style="margin-top:12px">
         <input type="hidden" name="action" value="create_case"/>
         <label>Titel</label>
-        <input name="title" required>
+        <input name="title" readonly placeholder="Bliver sat automatisk ud fra type">
         <label>Type</label>
-        <select name="case_type_text" required>
+        <select name="case_type_text" required data-case-type-select data-title-target="title">
           <option value="">Vælg type...</option>
           <?php foreach ($caseTypes as $t): ?>
             <option value="<?= h($t['GERNINGTXT']) ?>"><?= h($t['GERNINGTXT']) ?> (<?= h($t['GERNINGSKODE']) ?>)</option>
@@ -674,11 +757,11 @@ include __DIR__ . '/_layout.php';
         <label>Bevis titel (valgfri)</label>
         <input name="evidence_title" placeholder="Fx. Bodycam klip fra 12/04">
         <label>Bevismateriale (valgfri)</label>
-        <input type="file" name="evidence" accept="image/*,.pdf,.txt,.zip,.rar,.7z,.doc,.docx">
+        <input type="file" name="evidence[]" multiple accept="image/*,.pdf,.txt,.zip,.rar,.7z,.doc,.docx">
 
         <label>Tildel afdelinger</label>
         <input type="text" class="assign-filter" placeholder="Søg afdeling...">
-        <div data-filter-list class="picker-list">
+        <div data-filter-list class="picker-list" style="display:none;">
           <table class="table"><tbody>
           <?php foreach ($departments as $d): ?>
             <tr class="assign-row"><td style="width:36px;"><input style="width:auto;" type="checkbox" name="assigned_departments[]" value="<?= h($d['department']) ?>"></td><td><?= h($d['department']) ?></td></tr>
@@ -688,7 +771,7 @@ include __DIR__ . '/_layout.php';
 
         <label>Tildel medarbejder</label>
         <input type="text" class="assign-filter" placeholder="Søg medarbejder...">
-        <div data-filter-list class="picker-list">
+        <div data-filter-list class="picker-list" style="display:none;">
           <table class="table"><tbody>
           <?php foreach ($employees as $e): ?>
             <tr class="assign-row"><td style="width:36px;"><input style="width:auto;" type="checkbox" name="employee_ids[]" value="<?= (int)$e['id'] ?>"></td><td><?= h($e['name']) ?> (<?= h($e['badge_number']) ?>)</td></tr>
@@ -707,10 +790,11 @@ include __DIR__ . '/_layout.php';
         <a class="btn <?= $view==='mine' ? 'btn-solid' : '' ?>" href="sager.php?view=mine">Mine Sager</a>
         <a class="btn <?= $view==='all' ? 'btn-solid' : '' ?>" href="sager.php?view=all">Alle Sager</a>
         <a class="btn <?= $view==='archive' ? 'btn-solid' : '' ?>" href="sager.php?view=archive">Mit arkiv</a>
-        <a class="btn <?= $view==='global_archive' ? 'btn-solid' : '' ?>" href="sager.php?view=global_archive">Globalt arkiv</a>
+        <a class="btn <?= $view==='global_archive' ? 'btn-solid' : '' ?>" href="sager.php?view=global_archive&archive_tab=<?= h($archiveTab) ?>">Arkiv</a>
       </div>
       <form method="get" style="display:flex;gap:8px;align-items:end;">
         <input type="hidden" name="view" value="<?= h($view) ?>"/>
+        <?php if ($view === 'global_archive'): ?><input type="hidden" name="archive_tab" value="<?= h($archiveTab) ?>"/><?php endif; ?>
         <div>
           <label style="margin:0 0 4px 0;">Søg sager</label>
           <input name="q" value="<?= h($search) ?>" placeholder="Søg på journal nr, titel, tekst..."/>
@@ -722,8 +806,14 @@ include __DIR__ . '/_layout.php';
 
   <div class="card">
     <h2>
-      <?php if ($view==='all'): ?>Alle Sager<?php elseif ($view==='global_archive'): ?>Globalt arkiv<?php elseif ($view==='archive'): ?>Mit arkiv<?php else: ?>Mine Sager<?php endif; ?>
+       <?php if ($view==='all'): ?>Alle Sager<?php elseif ($view==='global_archive'): ?>Arkiv<?php elseif ($view==='archive'): ?>Mit arkiv<?php else: ?>Mine Sager<?php endif; ?>
     </h2>
+    <?php if ($view === 'global_archive'): ?>
+      <div style="margin-bottom:10px;display:flex;gap:8px;">
+        <a class="btn <?= $archiveTab==='stam' ? 'btn-solid' : '' ?>" href="sager.php?view=global_archive&archive_tab=stam<?= $search!=='' ? '&q='.urlencode($search) : '' ?>">Stam Arkiv</a>
+        <a class="btn <?= $archiveTab==='henlagt' ? 'btn-solid' : '' ?>" href="sager.php?view=global_archive&archive_tab=henlagt<?= $search!=='' ? '&q='.urlencode($search) : '' ?>">Henlagt</a>
+      </div>
+    <?php endif; ?>
     <table class="table">
       <thead><tr><th>Journal Nr.</th><th>Titel</th><th>Sagsansvarlig</th><th>Type / Gerningskode</th><th>Status</th><th>Handling</th></tr></thead>
       <tbody>
@@ -739,13 +829,23 @@ include __DIR__ . '/_layout.php';
           <td><?= h((string)($c['case_type_text'] ?? 'Ukendt')) ?> / <?= h((string)($c['offense_code'] ?? '-')) ?></td>
           <td><?= h($c['status']) ?></td>
           <td>
-            <button class="btn" type="button" onclick="openCaseModal(<?= (int)$c['id'] ?>)">Åbn</button>
+            <button class="btn" type="button" onclick="openCaseModal(<?= (int)$c['id'] ?>)">Åben</button>
             <?php if (!$isArchivedView): ?>
             <form method="post" style="display:inline-block;">
               <input type="hidden" name="action" value="archive_case"/>
               <input type="hidden" name="case_id" value="<?= (int)$c['id'] ?>"/>
               <button type="submit">Arkivér</button>
             </form>
+            <?php elseif ($view === 'global_archive' && (string)($c['archive_bucket'] ?? 'stam') !== 'henlagt'): ?>
+            <form method="post" style="display:inline-block;">
+              <input type="hidden" name="action" value="reopen_case"/>
+              <input type="hidden" name="case_id" value="<?= (int)$c['id'] ?>"/>
+              <input type="hidden" name="view" value="<?= h($view) ?>"/>
+              <input type="hidden" name="archive_tab" value="<?= h($archiveTab) ?>"/>
+              <input type="hidden" name="q" value="<?= h($search) ?>"/>
+              <button type="submit">Genåben</button>
+            </form>
+            <button type="button" class="btn" onclick="openHenlaegModal(<?= (int)$c['id'] ?>)">Henlæg</button>
             <?php endif; ?>
           </td>
         </tr>
@@ -809,12 +909,13 @@ include __DIR__ . '/_layout.php';
 
         <div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;">
           <input type="text" name="new_evidence_title" placeholder="Titel på bilag" style="min-width:220px;">
-          <input type="file" name="evidence" accept="image/*,.pdf,.txt,.zip,.rar,.7z,.doc,.docx">
+          <input type="file" name="evidence" accept="image/*,.pdf,.txt,.zip,.rar,.7z,.doc,.docx" data-autosubmit-evidence>
         </div>
-
+        <?php $responsibleDiscordCase = trim((string)($c['responsible_discord_id'] ?? $c['assigned_discord_id'] ?? '')); ?>
+        <?php if ($responsibleDiscordCase === (string)($u['discord_id'] ?? '')): ?>
         <label style="margin-top:10px;">Tildel afdelinger</label>
         <input type="text" class="assign-filter" placeholder="Søg afdeling...">
-        <div data-filter-list class="picker-list">
+        <div data-filter-list class="picker-list" style="display:none;">
           <table class="table"><tbody>
           <?php foreach ($departments as $d): ?>
             <?php $depName = (string)$d['department']; ?>
@@ -825,7 +926,7 @@ include __DIR__ . '/_layout.php';
 
         <label style="margin-top:10px;">Tildel medarbejder</label>
         <input type="text" class="assign-filter" placeholder="Søg medarbejder...">
-        <div data-filter-list class="picker-list">
+        <div data-filter-list class="picker-list" style="display:none;">
           <table class="table"><tbody>
           <?php foreach ($employees as $e): ?>
             <?php $did = trim((string)($e['discord_id'] ?? '')); ?>
@@ -834,7 +935,8 @@ include __DIR__ . '/_layout.php';
           </tbody></table>
         </div>
 
-        <button type="submit" class="btn btn-solid" style="margin-top:10px;">Gem ændringer</button>
+        <<button type="submit" class="btn btn-solid" style="margin-top:10px;">Gem ændringer</button>
+        <?php endif; ?>
       </form>
       <?php endif; ?>
       <table class="table">
@@ -921,6 +1023,22 @@ include __DIR__ . '/_layout.php';
     <button type="button" class="btn" onclick="closeCaseModal()" style="position:absolute;right:12px;top:12px;">Luk</button>
     <div id="caseModalContent"></div>
   </div>
+  </div>
+
+<div id="henlaegModal" class="modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:10000;">
+  <div style="max-width:520px;margin:16vh auto;background:#fff;padding:18px;border-radius:12px;position:relative;box-shadow:0 20px 45px rgba(11,42,74,.22);">
+    <button type="button" class="btn" onclick="closeHenlaegModal()" style="position:absolute;right:12px;top:12px;">Luk</button>
+    <h3 style="margin-top:0;">Grundet til henlæg.</h3>
+    <form method="post">
+      <input type="hidden" name="action" value="henlaeg_case"/>
+      <input type="hidden" name="case_id" id="henlaegCaseId" value="0"/>
+      <input type="hidden" name="view" value="<?= h($view) ?>"/>
+      <input type="hidden" name="archive_tab" value="<?= h($archiveTab) ?>"/>
+      <input type="hidden" name="q" value="<?= h($search) ?>"/>
+      <textarea name="henlagt_reason" rows="4" required placeholder="Skriv en kort begrundelse..."></textarea>
+      <button type="submit" class="btn btn-solid" style="margin-top:10px;">Henlæg</button>
+    </form>
+  </div>
 </div>
 
 <script>
@@ -934,8 +1052,10 @@ function setupAssignmentFilters(root) {
     input.dataset.bound = '1';
     const listWrap = input.nextElementSibling;
     if (!listWrap || !listWrap.hasAttribute('data-filter-list')) return;
+    if (!input.value.trim()) listWrap.style.display = 'none';
     input.addEventListener('input', function(){
       const q = input.value.toLowerCase().trim();
+      listWrap.style.display = q === '' ? 'none' : '';
       listWrap.querySelectorAll('.assign-row').forEach(function(row){
         const txt = row.textContent.toLowerCase();
         row.style.display = (q === '' || txt.indexOf(q) !== -1) ? '' : 'none';
@@ -957,11 +1077,52 @@ function closeCaseModal() {
   const modal = document.getElementById('caseModal');
   if (modal) modal.style.display = 'none';
 }
+function bindAutoEvidenceSubmit(root) {
+  (root || document).querySelectorAll('[data-autosubmit-evidence]').forEach(function(input){
+    if (input.dataset.bound === '1') return;
+    input.dataset.bound = '1';
+    input.addEventListener('change', function(){
+      if (!input.files || input.files.length === 0) return;
+      const form = input.closest('form');
+      if (form) form.submit();
+    });
+  });
+}
+function bindCreateTitleFromType(root) {
+  (root || document).querySelectorAll('[data-case-type-select]').forEach(function(sel){
+    const titleFieldName = sel.getAttribute('data-title-target') || 'title';
+    const form = sel.closest('form');
+    if (!form) return;
+    const titleInput = form.querySelector('input[name="' + titleFieldName + '"]');
+    if (!titleInput) return;
+    const setTitle = function(){
+      const v = (sel.value || '').trim();
+      titleInput.value = v ? ('G*' + v) : '';
+    };
+    sel.addEventListener('change', setTitle);
+    setTitle();
+  });
+}
+function openHenlaegModal(caseId) {
+  const modal = document.getElementById('henlaegModal');
+  const input = document.getElementById('henlaegCaseId');
+  if (!modal || !input) return;
+  input.value = String(caseId || 0);
+  modal.style.display = 'block';
+}
+function closeHenlaegModal() {
+  const modal = document.getElementById('henlaegModal');
+  if (modal) modal.style.display = 'none';
+}
 window.addEventListener('click', function(e){
   const modal = document.getElementById('caseModal');
   if (e.target === modal) closeCaseModal();
+  const henlaeg = document.getElementById('henlaegModal');
+  if (e.target === henlaeg) closeHenlaegModal();
 });
 setupAssignmentFilters(document);
+bindAutoEvidenceSubmit(document);
+bindCreateTitleFromType(document);
 if (openCaseFromQuery > 0) {
   openCaseModal(openCaseFromQuery);
 }
